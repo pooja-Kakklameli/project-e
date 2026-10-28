@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest responses
+      - run: pytest -q
+
+  build-scan-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # needed only to push to GHCR on main
+    env:
+      TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image name (GHCR requires it)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (loaded locally, not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            REVISION=${{ github.sha }}
+
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.TAG }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Create throwaway kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+
+      - name: Deploy to kind and smoke test
+        run: |
+          kind load docker-image "$IMAGE:$TAG" --name ci
+          sed "s|gist-api:ci|$IMAGE:$TAG|" k8s/deployment.yaml | kubectl apply -f -
+          kubectl rollout status deploy/gist-api --timeout=120s
+          kubectl port-forward svc/gist-api 8080:80 &
+          sleep 3
+          curl -fsS http://localhost:8080/health
+
+      - name: Show cluster state on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe pods
+          kubectl logs -l app=gist-api --tail=100 --all-containers
+
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image (main only)
+        if: github.ref == 'refs/heads/main'
+        run: docker push "$IMAGE:$TAG"
+
+  deploy-local:
+    # Runs on YOUR machine, only after the cloud job built, scanned, tested and pushed the image.
+    needs: build-scan-deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, windows, local-kind]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      TAG: ${{ github.sha }}
+      KIND_CLUSTER: gist
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull the exact image CI built
+        shell: pwsh
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $img = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower()):$($env:TAG)"
+          "IMAGE=$img" >> $env:GITHUB_ENV
+          $env:GHCR_TOKEN | docker login ghcr.io -u $env:GITHUB_ACTOR --password-stdin
+          docker pull $img
+
+      - name: Load into kind and deploy
+        shell: pwsh
+        run: |
+          kind load docker-image $env:IMAGE --name $env:KIND_CLUSTER
+          (Get-Content k8s/deployment.yaml) -replace 'gist-api:ci', $env:IMAGE |
+            kubectl --context "kind-$($env:KIND_CLUSTER)" apply -f -
+          kubectl --context "kind-$($env:KIND_CLUSTER)" rollout status deploy/gist-api --timeout=120s
+
+      - name: Roll back if the rollout failed
+        if: failure()
+        shell: pwsh
+        run: |
+          kubectl --context "kind-$($env:KIND_CLUSTER)" rollout undo deploy/gist-api
+          kubectl --context "kind-$($env:KIND_CLUSTER)" get pods
