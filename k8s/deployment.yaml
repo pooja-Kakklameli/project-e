@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gist-api
+  labels: { app: gist-api }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: gist-api }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: gist-api }
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gist-api
+          image: gist-api:ci            # replaced by the pipeline with the real tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CACHE_TTL_SECONDS
+              value: "60"
+            # Real token comes from a Secret, never from the manifest:
+            # - name: GITHUB_TOKEN
+            #   valueFrom: { secretKeyRef: { name: gist-api, key: github-token, optional: true } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["python", "-c", "import time; time.sleep(5)"] }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gist-api
+  labels: { app: gist-api }
+spec:
+  selector: { app: gist-api }
+  ports:
+    - name: http          # named, so a ServiceMonitor can reference it
+      port: 80
+      targetPort: 8080
