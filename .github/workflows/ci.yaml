@@ -1,4 +1,4 @@
-name: deploy-eks
+name: deploy-eks.
 
 on:
   push:
