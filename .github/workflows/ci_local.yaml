@@ -1,0 +1,117 @@
+name: cicd-local
+
+# Full CI/CD that runs entirely on YOUR Windows machine (self-hosted runner, label: local-kind):
+#   test -> build -> Trivy scan -> deploy to kind -> smoke test -> automatic rollback on failure.
+# Only Docker, kind, kubectl and PowerShell 7 are needed locally. Python and Trivy run in containers.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a deploy halfway: queue instead.
+concurrency:
+  group: cicd-local
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  KIND_CLUSTER: gist              # `kind get clusters` must list this name
+  NAMESPACE: default
+  IMAGE: gist-api:${{ github.sha }}   # unique per commit, so Kubernetes always rolls out
+  TRIVY_EXIT_CODE: "1"            # set to "0" to report findings without failing the pipeline
+
+jobs:
+  test:
+    runs-on: [self-hosted, windows, local-kind]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight (fail early with a clear message)
+        run: |
+          docker info --format '{{.ServerVersion}}'
+          if ($LASTEXITCODE -ne 0) { throw "Docker is not running" }
+          $clusters = @(kind get clusters)
+          if ($clusters -notcontains $env:KIND_CLUSTER) { throw "kind cluster '$($env:KIND_CLUSTER)' not found. Found: $clusters" }
+
+      - name: Unit tests (inside python:3.12, same version as the image)
+        run: |
+          docker run --rm -v "${PWD}:/src" -w /src python:3.12-slim-bookworm sh -c "pip install --quiet -r requirements.txt pytest responses && pytest -q -p no:cacheprovider"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build:
+    needs: test
+    runs-on: [self-hosted, windows, local-kind]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build --build-arg REVISION=${{ github.sha }} -t $env:IMAGE .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Trivy scan (HIGH/CRITICAL with a fix available)
+        run: |
+          docker save $env:IMAGE -o image.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker run --rm -v "${PWD}:/work" -v trivy-cache:/root/.cache/ aquasec/trivy:0.58.0 image --input /work/image.tar --severity HIGH,CRITICAL --ignore-unfixed --exit-code $env:TRIVY_EXIT_CODE
+          $code = $LASTEXITCODE
+          Remove-Item image.tar -Force -ErrorAction SilentlyContinue
+          exit $code
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, windows, local-kind]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load image into kind
+        run: |
+          kind load docker-image $env:IMAGE --name $env:KIND_CLUSTER
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Deploy and wait for rollout
+        run: |
+          $ctx = "kind-$($env:KIND_CLUSTER)"
+          (Get-Content k8s/deployment.yaml) -replace 'gist-api:ci', $env:IMAGE |
+            kubectl --context $ctx -n $env:NAMESPACE apply -f -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          kubectl --context $ctx -n $env:NAMESPACE rollout status deploy/gist-api --timeout=120s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test through the Service
+        run: |
+          $ctx = "kind-$($env:KIND_CLUSTER)"
+          $pf = Start-Process kubectl -ArgumentList "--context $ctx -n $($env:NAMESPACE) port-forward svc/gist-api 18080:80" -PassThru -WindowStyle Hidden
+          try {
+            Start-Sleep -Seconds 5
+            Invoke-RestMethod -Uri http://localhost:18080/health -TimeoutSec 5   # throws on non-2xx
+          } finally {
+            Stop-Process -Id $pf.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Summary
+        run: |
+          $ctx = "kind-$($env:KIND_CLUSTER)"
+          $pods = kubectl --context $ctx -n $env:NAMESPACE get pods -l app=gist-api | Out-String
+          ("### Deployed to kind", "", "- image: ``$env:IMAGE``", "- commit: ${{ github.sha }}", "", '```', $pods, '```') |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Roll back and show diagnostics if anything failed
+        if: failure()
+        run: |
+          $ctx = "kind-$($env:KIND_CLUSTER)"
+          kubectl --context $ctx -n $env:NAMESPACE rollout undo deploy/gist-api
+          kubectl --context $ctx -n $env:NAMESPACE get pods -o wide
+          kubectl --context $ctx -n $env:NAMESPACE describe deploy/gist-api
+          kubectl --context $ctx -n $env:NAMESPACE logs -l app=gist-api --tail=50 --all-containers
+          exit 0
+
+      - name: Tidy dangling images
+        if: always()
+        run: docker image prune -f
