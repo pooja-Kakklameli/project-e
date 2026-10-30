@@ -1,0 +1,45 @@
+name: debug-oidc
+
+# Prints the OIDC claims GitHub sends to AWS, so you can compare `sub` with your trust policy.
+# Run it from Actions > debug-oidc > Run workflow (the file must be on the default branch).
+# Delete this workflow once the role assumption works.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  without-environment:        # what the `build` job sends
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show claims
+        run: |
+          curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c '
+          import sys, json, base64
+          token = json.load(sys.stdin)["value"]
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          for key in ("iss", "aud", "sub", "repository", "ref", "environment"):
+              print(f"{key}: {claims.get(key)}")
+          '
+
+  with-environment:           # what the `deploy` job sends
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Show claims
+        run: |
+          curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c '
+          import sys, json, base64
+          token = json.load(sys.stdin)["value"]
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          for key in ("iss", "aud", "sub", "repository", "ref", "environment"):
+              print(f"{key}: {claims.get(key)}")
+          '
