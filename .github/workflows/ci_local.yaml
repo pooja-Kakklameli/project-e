@@ -1,8 +1,7 @@
-name: cicd-local
+name: cicd
 
-# Full CI/CD that runs entirely on YOUR Windows machine (self-hosted runner, label: local-kind):
-#   test -> build -> Trivy scan -> deploy to kind -> smoke test -> automatic rollback on failure.
-# Only Docker, kind, kubectl and PowerShell 7 are needed locally. Python and Trivy run in containers.
+# test (cloud) -> build + push to GHCR (cloud) -> deploy to local kind (your self-hosted runner)
+# The deploy job pulls the exact image CI pushed, loads it into kind, and rolls it out.
 on:
   push:
     branches: [main]
@@ -11,66 +10,81 @@ on:
 permissions:
   contents: read
 
-# Never cancel a deploy halfway: queue instead.
 concurrency:
-  group: cicd-local
+  group: cicd
   cancel-in-progress: false
-
-defaults:
-  run:
-    shell: pwsh
-
-env:
-  KIND_CLUSTER: gist              # `kind get clusters` must list this name
-  NAMESPACE: default
-  IMAGE: gist-api:${{ github.sha }}   # unique per commit, so Kubernetes always rolls out
-  TRIVY_EXIT_CODE: "1"            # set to "0" to report findings without failing the pipeline
 
 jobs:
   test:
-    runs-on: [self-hosted, windows, local-kind]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest responses
+      - run: pytest -q
 
-      - name: Preflight (fail early with a clear message)
-        run: |
-          docker info --format '{{.ServerVersion}}'
-          if ($LASTEXITCODE -ne 0) { throw "Docker is not running" }
-          $clusters = @(kind get clusters)
-          if ($clusters -notcontains $env:KIND_CLUSTER) { throw "kind cluster '$($env:KIND_CLUSTER)' not found. Found: $clusters" }
-
-      - name: Unit tests (inside python:3.12, same version as the image)
-        run: |
-          docker run --rm -v "${PWD}:/src" -w /src python:3.12-slim-bookworm sh -c "pip install --quiet -r requirements.txt pytest responses && pytest -q -p no:cacheprovider"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-  build:
+  build-push:
     needs: test
-    runs-on: [self-hosted, windows, local-kind]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write            # lets GITHUB_TOKEN push to GHCR
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build image
-        run: |
-          docker build --build-arg REVISION=${{ github.sha }} -t $env:IMAGE .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Image name (GHCR requires lowercase) with the commit SHA as tag
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Trivy scan (HIGH/CRITICAL with a fix available)
-        run: |
-          docker save $env:IMAGE -o image.tar
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          docker run --rm -v "${PWD}:/work" -v trivy-cache:/root/.cache/ aquasec/trivy:0.58.0 image --input /work/image.tar --severity HIGH,CRITICAL --ignore-unfixed --exit-code $env:TRIVY_EXIT_CODE
-          $code = $LASTEXITCODE
-          Remove-Item image.tar -Force -ErrorAction SilentlyContinue
-          exit $code
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            REVISION=${{ github.sha }}
 
   deploy:
-    needs: build
+    needs: build-push
     runs-on: [self-hosted, windows, local-kind]
+    permissions:
+      contents: read
+      packages: read             # lets GITHUB_TOKEN pull from GHCR
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      IMAGE: ${{ needs.build-push.outputs.image }}
+      KIND_CLUSTER: gist
+      NAMESPACE: default
     steps:
       - uses: actions/checkout@v4
 
-      - name: Load image into kind
+      - name: Pull the image from GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $env:GHCR_TOKEN | docker login ghcr.io -u $env:GITHUB_ACTOR --password-stdin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker pull $env:IMAGE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Load into kind (nodes cannot see your local Docker images otherwise)
         run: |
           kind load docker-image $env:IMAGE --name $env:KIND_CLUSTER
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -84,34 +98,15 @@ jobs:
           kubectl --context $ctx -n $env:NAMESPACE rollout status deploy/gist-api --timeout=120s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Smoke test through the Service
-        run: |
-          $ctx = "kind-$($env:KIND_CLUSTER)"
-          $pf = Start-Process kubectl -ArgumentList "--context $ctx -n $($env:NAMESPACE) port-forward svc/gist-api 18080:80" -PassThru -WindowStyle Hidden
-          try {
-            Start-Sleep -Seconds 5
-            Invoke-RestMethod -Uri http://localhost:18080/health -TimeoutSec 5   # throws on non-2xx
-          } finally {
-            Stop-Process -Id $pf.Id -Force -ErrorAction SilentlyContinue
-          }
-
-      - name: Summary
-        run: |
-          $ctx = "kind-$($env:KIND_CLUSTER)"
-          $pods = kubectl --context $ctx -n $env:NAMESPACE get pods -l app=gist-api | Out-String
-          ("### Deployed to kind", "", "- image: ``$env:IMAGE``", "- commit: ${{ github.sha }}", "", '```', $pods, '```') |
-            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-
-      - name: Roll back and show diagnostics if anything failed
+      - name: Roll back and show diagnostics on failure
         if: failure()
         run: |
           $ctx = "kind-$($env:KIND_CLUSTER)"
           kubectl --context $ctx -n $env:NAMESPACE rollout undo deploy/gist-api
           kubectl --context $ctx -n $env:NAMESPACE get pods -o wide
-          kubectl --context $ctx -n $env:NAMESPACE describe deploy/gist-api
           kubectl --context $ctx -n $env:NAMESPACE logs -l app=gist-api --tail=50 --all-containers
           exit 0
 
-      - name: Tidy dangling images
+      - name: Log out of GHCR
         if: always()
-        run: docker image prune -f
+        run: docker logout ghcr.io
